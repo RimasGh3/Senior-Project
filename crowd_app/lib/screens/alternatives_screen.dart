@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import '../services/api_service.dart';
+import '../services/location_service.dart';
+import '../services/gate_coordinates.dart';
 import '../widgets/stadium_map.dart';
 import '../widgets/gate_card.dart';
 
@@ -34,51 +37,121 @@ class AlternativesScreen extends StatefulWidget {
 }
 
 class _AlternativesScreenState extends State<AlternativesScreen> {
-  static const _gates = [
-    _GateOption(
-      id: '1',
-      name: 'Gate 1',
-      previewGate: PreviewGate.gate1,
-      waitMin: 6,
-      walkMin: 7,
-      crowd: 'Medium',
-      isRecommended: true,
-      note: 'Lowest predicted waiting time',
-      distanceM: 520,
-    ),
-    _GateOption(
-      id: '4',
-      name: 'Gate 4',
-      previewGate: PreviewGate.gate4,
-      waitMin: 7,
-      walkMin: 7,
-      crowd: 'Medium',
-    ),
-    _GateOption(
-      id: '2',
-      name: 'Gate 2',
-      previewGate: PreviewGate.gate2,
-      waitMin: 1,
-      walkMin: 5,
-      crowd: 'Low',
-    ),
-    _GateOption(
-      id: '3',
-      name: 'Gate 3',
-      previewGate: PreviewGate.gate3,
-      waitMin: 12,
-      walkMin: 10,
-      crowd: 'High',
-    ),
+  // Fallback static data used when backend is unreachable.
+  static const _fallbackGates = [
+    _GateOption(id: '1', name: 'Gate 1', previewGate: PreviewGate.gate1, waitMin: 6,  walkMin: 7, crowd: 'Medium', isRecommended: true, note: 'Lowest predicted waiting time', distanceM: 520),
+    _GateOption(id: '4', name: 'Gate 4', previewGate: PreviewGate.gate4, waitMin: 7,  walkMin: 7, crowd: 'Medium'),
+    _GateOption(id: '2', name: 'Gate 2', previewGate: PreviewGate.gate2, waitMin: 1,  walkMin: 5, crowd: 'Low'),
+    _GateOption(id: '3', name: 'Gate 3', previewGate: PreviewGate.gate3, waitMin: 12, walkMin: 10, crowd: 'High'),
   ];
 
+  List<_GateOption> _gates = _fallbackGates;
   String _selectedId = '1';
+  bool _loading = true;
 
   _GateOption get _selected =>
       _gates.firstWhere((g) => g.id == _selectedId);
 
+  _GateOption _buildGateOption({
+    required GateCoord coord,
+    required dynamic position, // Position? from geolocator
+    required int waitMin,
+    required String crowd,
+    bool isRecommended = false,
+    String? note,
+  }) {
+    int walkMin = coord.walkMinBase;
+    int? distanceM;
+
+    if (position != null) {
+      final dist = LocationService.distanceTo(position, coord);
+      walkMin   = LocationService.walkMinutes(dist);
+      distanceM = dist.round();
+    }
+
+    final previewMap = {
+      1: PreviewGate.gate1,
+      2: PreviewGate.gate2,
+      3: PreviewGate.gate3,
+      4: PreviewGate.gate4,
+    };
+
+    return _GateOption(
+      id: coord.id.toString(),
+      name: coord.name,
+      previewGate: previewMap[coord.id] ?? PreviewGate.gate1,
+      waitMin: waitMin,
+      walkMin: walkMin,
+      crowd: crowd,
+      isRecommended: isRecommended,
+      note: note,
+      distanceM: distanceM,
+    );
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchGates();
+  }
+
+  Future<void> _fetchGates() async {
+    final metrics  = await ApiService.fetchMetrics();
+    final position = await LocationService.getCurrentPosition();
+
+    if (metrics == null || !mounted) {
+      setState(() => _loading = false);
+      return;
+    }
+
+    final count = (metrics['peoplePred'] as num?)?.toInt() ?? 0;
+    final risk  = (metrics['riskLevel'] as String?) ?? 'Normal';
+    final baseWait = waitMinFromCount(count);
+
+    // Build gate options with real distances when GPS is available
+    final gates = [
+      _buildGateOption(
+        coord: kGateCoords[3], // Gate 4
+        position: position,
+        waitMin: (baseWait * 0.5).ceil().clamp(1, 60),
+        crowd: 'Low',
+        isRecommended: risk != 'Normal',
+        note: risk != 'Normal' ? 'Least crowded right now' : null,
+      ),
+      _buildGateOption(
+        coord: kGateCoords[1], // Gate 2
+        position: position,
+        waitMin: (baseWait * 0.8).ceil().clamp(1, 60),
+        crowd: crowdLabelFromRisk(risk) == 'High' ? 'Medium' : 'Low',
+        isRecommended: risk == 'Normal',
+        note: risk == 'Normal' ? 'Lowest predicted waiting time' : null,
+      ),
+      _buildGateOption(
+        coord: kGateCoords[0], // Gate 1
+        position: position,
+        waitMin: baseWait,
+        crowd: crowdLabelFromRisk(risk),
+      ),
+      _buildGateOption(
+        coord: kGateCoords[2], // Gate 3
+        position: position,
+        waitMin: (baseWait * 1.5).ceil().clamp(1, 60),
+        crowd: risk == 'Normal' ? 'Medium' : 'High',
+      ),
+    ];
+
+    gates.sort((a, b) => a.waitMin.compareTo(b.waitMin));
+    if (mounted) setState(() { _gates = gates; _selectedId = gates.first.id; _loading = false; });
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (_loading) {
+      return const Scaffold(
+        backgroundColor: Color(0xFFF5F6FA),
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
     return Scaffold(
       backgroundColor: const Color(0xFFF5F6FA),
       body: SafeArea(

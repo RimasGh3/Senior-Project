@@ -1,0 +1,26 @@
+# Claude Code memory (personal, not for repo)
+.claude/
+
+# Python
+backend/venv/
+backend/__pycache__/
+backend/*.pyc
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Flutter
+crowd_app/.dart_tool/
+crowd_app/build/
+dashboard/.dart_tool/
+dashboard/build/
+
+# Supabase temp
+supabase-backend/supabase/.temp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Figma / UI Design exports (reference only)
+UI Design/

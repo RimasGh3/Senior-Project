@@ -4,6 +4,23 @@
 -- functions can decrypt them.
 -- ============================================================
 
+-- ── AES key resolver ─────────────────────────────────────────
+-- Uses app.aes_key if set (production via superuser), otherwise
+-- falls back to the local-dev key below.
+-- ⚠ In production: run  ALTER DATABASE postgres SET app.aes_key='...'
+--   as a superuser BEFORE deploying, or use Supabase Vault.
+create or replace function _aes_key()
+  returns text
+  language sql
+  security definer
+  stable
+as $$
+  select coalesce(
+    nullif(current_setting('app.aes_key', true), ''),
+    'AramcoStadium@AES256Key!Local32!!'   -- 32 chars, local dev only
+  );
+$$;
+
 -- ── Helper: encrypt a float with AES-256 ─────────────────────
 create or replace function enc_float(p_value float)
   returns bytea
@@ -13,7 +30,7 @@ create or replace function enc_float(p_value float)
 as $$
   select pgp_sym_encrypt(
     p_value::text,
-    current_setting('app.aes_key'),
+    _aes_key(),
     'cipher-algo=aes256'
   );
 $$;
@@ -27,7 +44,7 @@ create or replace function dec_float(p_cipher bytea)
 as $$
   select pgp_sym_decrypt(
     p_cipher,
-    current_setting('app.aes_key')
+    _aes_key()
   )::float;
 $$;
 

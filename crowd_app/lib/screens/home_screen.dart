@@ -1,7 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:geolocator/geolocator.dart';
 import 'dart:async';
 import '../models/alert_model.dart';
+import '../services/api_service.dart';
+import '../services/location_service.dart';
+import '../services/gate_coordinates.dart';
 import '../widgets/stadium_map.dart';
 import 'alert_screen.dart';
 import 'alternatives_screen.dart';
@@ -21,24 +25,44 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _hasError = false;
   String _lastUpdated = 'just now';
 
-  // ── Simulated recommended gate data (replace with DB fetch)
   String _recGateName = 'Gate 2';
   int _waitMin = 1;
   String _walkTime = '5 min walk';
-  String _crowdLevel = 'Low'; // Low / Medium / High
+  String _crowdLevel = 'Low';
   double _crowdFill = 0.20;
   bool _highConfidence = true;
   PreviewGate _activeGate = PreviewGate.gate2;
+  bool _gpsActive = false;
+  Position? _userPosition;
 
   @override
   void initState() {
     super.initState();
+    _initGps();
     _fetch();
     _timer = Timer.periodic(const Duration(seconds: 5), (_) => _fetch());
     _subscribeToAlerts();
   }
 
+  Future<void> _initGps() async {
+    final pos = await LocationService.getCurrentPosition();
+    if (pos != null && mounted) {
+      setState(() { _userPosition = pos; _gpsActive = true; });
+      // Save encrypted GPS to Supabase
+      await LocationService.saveGpsToSupabase(
+        pos,
+        stadiumId: 1,
+        zoneId: 1,
+        nearestGateId: 1,
+        sessionId: Supabase.instance.client.auth.currentSession?.user.id ?? 'anonymous',
+      );
+    }
+  }
+
   void _subscribeToAlerts() {
+    // Alert data is AES-256 encrypted in the database — severity cannot be
+    // read directly. Any row inserted into alert is already HIGH severity
+    // (the backend only inserts alerts when threshold is exceeded).
     _alertChannel = _db
         .channel('public:alert')
         .onPostgresChanges(
@@ -46,77 +70,67 @@ class _HomeScreenState extends State<HomeScreen> {
           schema: 'public',
           table: 'alert',
           callback: (payload) {
-            final row = payload.newRecord;
-            final sev = row['severity'] as String? ?? 'HIGH';
-            if (sev == 'HIGH' && mounted) _showAlert();
+            if (mounted) _showAlert();
           },
         )
         .subscribe();
   }
 
   Future<void> _fetch() async {
-    try {
-      final res = await _db
-          .from('prediction')
-          .select(
-            'pred_id, gate_id, wait_pred_min, congestion_prob, severity, ts, gate(name)',
-          )
-          .order('ts', ascending: false)
-          .limit(10);
+    // Try the AI backend first (real-time data).
+    final metrics = await ApiService.fetchMetrics();
+    if (metrics != null && mounted) {
+      final risk  = (metrics['riskLevel'] as String?) ?? 'Normal';
+      final count = (metrics['peoplePred'] as num?)?.toInt() ?? 0;
+      final gate  = _bestGate(risk);
 
-      final data = List<Map<String, dynamic>>.from(res as List);
-      if (data.isEmpty) {
-        if (mounted)
-          setState(() {
-            _loading = false;
-          });
-        return;
+      // Real walk time from GPS distance, or fallback to base value
+      String walkTime = '${gate.walkMinBase} min walk';
+      if (_userPosition != null) {
+        final dist = LocationService.distanceTo(_userPosition!, gate);
+        final mins = LocationService.walkMinutes(dist);
+        walkTime = '$mins min walk (${dist.round()} m)';
       }
 
-      // Keep only latest prediction per gate
-      final Map<int, Map<String, dynamic>> latestPerGate = {};
-      for (final row in data) {
-        final gid = row['gate_id'] as int;
-        if (!latestPerGate.containsKey(gid)) latestPerGate[gid] = row;
-      }
+      setState(() {
+        _recGateName = gate.name;
+        _waitMin     = waitMinFromCount(count);
+        _walkTime    = walkTime;
+        _crowdLevel  = crowdLabelFromRisk(risk);
+        _crowdFill   = crowdFillFromRisk(risk);
+        _highConfidence = risk == 'Normal';
+        _activeGate  = _previewGateFor(gate.id);
+        _hasError    = false;
+        _loading     = false;
+        _lastUpdated = 'just now';
+      });
+      return;
+    }
 
-      final rows = latestPerGate.values.toList();
-      rows.sort(
-        (a, b) =>
-            (a['wait_pred_min'] as num).compareTo(b['wait_pred_min'] as num),
-      );
-      final best = rows.first;
-      final sev = (best['severity'] as String?) ?? 'LOW';
-      final gateName = best['gate'] != null
-          ? best['gate']['name'] as String
-          : 'Gate ${best['gate_id']}';
+    // Backend unreachable — show error indicator, keep last known values.
+    if (mounted) setState(() { _hasError = true; _loading = false; });
+  }
 
-      if (mounted) {
-        setState(() {
-          _recGateName = gateName;
-          _waitMin = (best['wait_pred_min'] as num).round();
-          _crowdLevel = sev == 'HIGH'
-              ? 'High'
-              : sev == 'MEDIUM'
-              ? 'Medium'
-              : 'Low';
-          _crowdFill = sev == 'HIGH'
-              ? 0.85
-              : sev == 'MEDIUM'
-              ? 0.55
-              : 0.20;
-          _highConfidence = sev == 'LOW';
-          _hasError = false;
-          _loading = false;
-          _lastUpdated = 'just now';
-        });
-      }
-    } catch (e) {
-      if (mounted)
-        setState(() {
-          _hasError = true;
-          _loading = false;
-        });
+  // Picks best gate using real GPS distance + crowd level.
+  // Falls back to crowd-only recommendation if GPS unavailable.
+  GateCoord _bestGate(String risk) {
+    if (_userPosition != null) {
+      return LocationService.bestGate(_userPosition!, risk);
+    }
+    // GPS not available — pick by crowd level only
+    switch (risk) {
+      case 'Critical': return kGateCoords[3]; // Gate 4
+      case 'Busy':     return kGateCoords[1]; // Gate 2
+      default:         return kGateCoords[2]; // Gate 3
+    }
+  }
+
+  PreviewGate _previewGateFor(int gateId) {
+    switch (gateId) {
+      case 1: return PreviewGate.gate1;
+      case 2: return PreviewGate.gate2;
+      case 4: return PreviewGate.gate4;
+      default: return PreviewGate.gate3;
     }
   }
 
@@ -287,18 +301,22 @@ class _HomeScreenState extends State<HomeScreen> {
                   Container(
                     width: 9,
                     height: 9,
-                    decoration: const BoxDecoration(
-                      color: Color(0xFF43A047),
+                    decoration: BoxDecoration(
+                      color: _gpsActive
+                          ? const Color(0xFF43A047)
+                          : const Color(0xFF9E9E9E),
                       shape: BoxShape.circle,
                     ),
                   ),
                   const SizedBox(width: 6),
-                  const Text(
-                    'Live Location ON',
+                  Text(
+                    _gpsActive ? 'Live Location ON' : 'Live Location OFF',
                     style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.w500,
-                      color: Color(0xFF1565C0),
+                      color: _gpsActive
+                          ? const Color(0xFF1565C0)
+                          : const Color(0xFF9E9E9E),
                     ),
                   ),
                   if (_hasError) ...[
